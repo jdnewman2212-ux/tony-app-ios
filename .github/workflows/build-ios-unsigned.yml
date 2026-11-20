@@ -1,0 +1,133 @@
+# Tony — build an UNSIGNED iOS .ipa on a macOS runner.
+#
+# Why unsigned: the owner installs the .ipa with SideStore on his own
+# iPhone; SideStore re-signs it with his free Apple ID (7-day signature).
+# No Apple Developer account, no certificates, no secrets are needed here.
+#
+# How to run: GitHub → Actions → "Build Tony iOS (unsigned IPA)" →
+# Run workflow. Download the `tony-ios-unsigned-ipa` artifact when it
+# finishes (it contains Tony-unsigned.ipa).
+#
+# The setup steps mirror the upstream release workflow's iOS job
+# (.github/workflows/release.yml): same Node, Ruby and CocoaPods flow.
+# Only the final step differs — `xcodebuild archive` with signing fully
+# disabled instead of fastlane/TestFlight (which needs paid credentials).
+
+name: Build Tony iOS (unsigned IPA)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_ios_unsigned:
+    runs-on: macos-26 # same runner/Xcode major as upstream release workflow
+    env:
+      NODE_OPTIONS: '--max-old-space-size=8192'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Ensure Metal toolchain
+        run: |
+          xcrun -sdk iphoneos metal -v || xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk iphonesimulator metal -v
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.0'
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Restore enriched-markdown native assets
+        # Same fix as upstream: a cached node_modules can hold a failed
+        # download; the script reads the app config only via INIT_CWD.
+        run: INIT_CWD="$GITHUB_WORKSPACE" node node_modules/react-native-enriched-markdown/postinstall.mjs
+
+      - name: Set up Ruby and Bundler
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2.3'
+          bundler-cache: true
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios
+        run: pod install
+
+      - name: Create Env.xcconfig (empty values — offline personal build)
+        run: |
+          cat > ios/Config/Env.xcconfig << 'EOL'
+          // Environment-specific build settings (empty for the Tony fork).
+          GOOGLE_WEB_CLIENT_ID =
+          REVERSED_GOOGLE_IOS_CLIENT_ID =
+          EOL
+
+      - name: Create .env file (offline configuration)
+        run: |
+          cat > .env << 'EOL'
+          FIREBASE_FUNCTIONS_URL=
+
+          # PalsHub/Supabase — disabled: Tony is a fully offline fork.
+          SUPABASE_URL=
+          SUPABASE_ANON_KEY=
+          PALSHUB_API_BASE_URL=
+
+          # App Configuration
+          APP_URL=pocketpal://app
+
+          # Feature Flags (true/false)
+          ENABLE_PALSHUB_INTEGRATION=false
+          ENABLE_AUTHENTICATION=false
+          ENABLE_OFFLINE_MODE=true
+
+          # Google Sign-In — disabled in this fork.
+          GOOGLE_IOS_CLIENT_ID=
+          GOOGLE_WEB_CLIENT_ID=
+          EOL
+
+      - name: Build unsigned archive (.app)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -workspace ios/PocketPal.xcworkspace \
+            -scheme PocketPal \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$RUNNER_TEMP/Tony.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM=""
+
+      - name: Package unsigned .ipa
+        run: |
+          APP_PATH="$RUNNER_TEMP/Tony.xcarchive/Products/Applications/PocketPal.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::Built .app not found at $APP_PATH"
+            ls -R "$RUNNER_TEMP/Tony.xcarchive/Products" || true
+            exit 1
+          fi
+          rm -rf Payload Tony-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry Tony-unsigned.ipa Payload
+          ls -lh Tony-unsigned.ipa
+
+      - name: Upload unsigned .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tony-ios-unsigned-ipa
+          path: Tony-unsigned.ipa
+          retention-days: 30
+          if-no-files-found: error
